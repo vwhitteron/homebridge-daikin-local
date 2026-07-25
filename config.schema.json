@@ -226,6 +226,19 @@
         "required": false,
         "placeholder": "Night Quiet"
       },
+      "enableDehumidifyMode": {
+        "title": "Dehumidify switch enabled",
+        "description": "Enables a switch in HomeKit that runs the unit in dry (dehumidify) mode with automatic fan speed when turned ON. Turning it OFF powers the unit off. Note: many units manage the fan themselves in dry mode and will ignore the requested fan speed.",
+        "type": "boolean",
+        "default": false
+      },
+      "dehumidifyModeName": {
+        "title": "Dehumidify switch name (optional)",
+        "description": "Custom name for the Dehumidify switch. Default: 'Dehumidify'. Toggle the switch and check Homebridge logs to identify which one it is.",
+        "type": "string",
+        "required": false,
+        "placeholder": "Dehumidify"
+      },
       "enableFanSpeedInSettings": {
         "title": "Enable Fan Speed in AC Settings",
         "description": "When enabled (default), adds a fan speed slider directly in the AC accessory settings for easy access. Disable this if you only want to use the separate Fan accessory for fan speed control.",
@@ -400,6 +413,13 @@
           "key": "nightQuietModeName",
           "condition": {
             "functionBody": "return model.enableNightQuietMode === true;"
+          }
+        },
+        "enableDehumidifyMode",
+        {
+          "key": "dehumidifyModeName",
+          "condition": {
+            "functionBody": "return model.enableDehumidifyMode === true;"
           }
         }
       ]

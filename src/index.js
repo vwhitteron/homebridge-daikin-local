@@ -341,15 +341,21 @@ function Daikin(log, config) {
   this.nightQuietModeService = new Service.Switch(this.nightQuietModeName, 'night-quiet-switch');
   this.nightQuietModeService.setCharacteristic(Characteristic.ConfiguredName, this.nightQuietModeName);
 
+  this.dehumidifyModeName = config.dehumidifyModeName || 'Dehumidify';
+  this.dehumidifyModeService = new Service.Switch(this.dehumidifyModeName, 'dehumidify-mode-switch');
+  this.dehumidifyModeService.setCharacteristic(Characteristic.ConfiguredName, this.dehumidifyModeName);
+
   // State for toggle modes
   this.Econo_Mode = false;
   this.Powerful_Mode = false;
   this.NightQuiet_Mode = false;
+  this.Dehumidify_Mode = false;
 
   // Config options for enabling these features
   this.enableEconoMode = !!config.enableEconoMode;
   this.enablePowerfulMode = !!config.enablePowerfulMode;
   this.enableNightQuietMode = !!config.enableNightQuietMode;
+  this.enableDehumidifyMode = !!config.enableDehumidifyMode;
 
   // Swing switch config options (Faikout independent vertical/horizontal control)
   this.enableVerticalSwingSwitch = !!config.enableVerticalSwingSwitch;
@@ -885,6 +891,9 @@ Daikin.prototype = {
     });
   },
   setActive(power, callback) {
+      // Powering on applies the configured default mode, powering off stops dry mode:
+      // either way the unit is no longer dehumidifying.
+      this.clearDehumidifyMode('AC power changed');
       this.sendGetRequest(this.get_control_info, body => {
         const responseValues = this.parseResponse(body);
         this.log.info('setActive: Power is %s, Mode is %s. Going to change power to %s.', responseValues.pow, responseValues.mode, power);
@@ -1197,6 +1206,8 @@ Daikin.prototype = {
 
   setTargetHeaterCoolerState(state, callback) {
     this.log.info('setTargetHeaterCoolerState: received new state %s', state);
+    // Every HomeKit target state (auto/cool/heat) takes the unit out of dry mode.
+    this.clearDehumidifyMode('AC mode changed');
           this.sendGetRequest(this.get_control_info, body => {
                   const currentValues = this.parseResponse(body);
                   let mode = currentValues.mode;
@@ -1484,6 +1495,105 @@ Daikin.prototype = {
         }, {skipCache: true, skipQueue: true});
       }, {skipCache: true});
     }
+  },
+
+  getDehumidifyMode: function (callback) {
+    this.sendGetRequest(this.get_control_info, body => {
+      const responseValues = this.parseResponse(body);
+      this.log.debug('getDehumidifyMode: pow is: %s, mode is: %s', responseValues.pow, responseValues.mode);
+      callback(null, responseValues.pow === '1' && responseValues.mode === '2');
+    });
+  },
+
+  getDehumidifyModeFV: function (callback) { // FV 210510: Wrapper for service call to early return
+    const counter = ++this.counter;
+    this.log.debug('getDehumidifyModeFV: early callback with cached DehumidifyMode: %s (%d).', this.Dehumidify_Mode, counter);
+    callback(null, this.Dehumidify_Mode);
+    this.getDehumidifyMode((error, state) => {
+      this.Dehumidify_Mode = state;
+      this.dehumidifyModeService.getCharacteristic(Characteristic.On).updateValue(this.Dehumidify_Mode);
+      this.log.debug('getDehumidifyModeFV: update DehumidifyMode: %s (%d).', this.Dehumidify_Mode, counter);
+    });
+  },
+
+  // Re-read pow and f_rate straight from the unit (bypassing the cache) and push both to
+  // the fan services, so HomeKit does not show a stale fan tile until the next poll after
+  // a mode change. The speed alone is not enough: a Fan service reporting On=false shows
+  // no speed at all, whatever RotationSpeed holds.
+  refreshFanSpeed: function () {
+    this.sendGetRequest(this.get_control_info, body => {
+      const responseValues = this.parseResponse(body);
+
+      this.Fan_Speed = this.daikinSpeedToRaw(responseValues.f_rate);
+      this.log.debug('refreshFanSpeed: f_rate is %s, update Speed: %s.', responseValues.f_rate, this.Fan_Speed);
+      this.FanService.getCharacteristic(Characteristic.RotationSpeed).updateValue(this.Fan_Speed);
+      if (this.heaterCoolerService.testCharacteristic(Characteristic.RotationSpeed)) {
+        this.heaterCoolerService.getCharacteristic(Characteristic.RotationSpeed).updateValue(this.Fan_Speed);
+      }
+
+      this.Fan_Status = responseValues.pow === '1';
+      this.log.debug('refreshFanSpeed: pow is %s, update Status: %s.', responseValues.pow, this.Fan_Status ? 'on' : 'off');
+      this.FanService.getCharacteristic(Characteristic.On).updateValue(this.Fan_Status);
+    }, {skipCache: true});
+  },
+
+  // Dry mode is exclusive on the unit: any request that moves it elsewhere (a new AC mode,
+  // a power change, or a manual fan speed) leaves dry mode behind, so drop the switch
+  // rather than let HomeKit keep showing dehumidify as active until the next poll.
+  clearDehumidifyMode: function (reason) {
+    if (!this.Dehumidify_Mode) {
+      return;
+    }
+
+    this.Dehumidify_Mode = false;
+    this.log.info('clearDehumidifyMode: turning the Dehumidify switch OFF (%s).', reason);
+    if (this.enableDehumidifyMode) {
+      this.dehumidifyModeService.getCharacteristic(Characteristic.On).updateValue(false);
+    }
+  },
+
+  setDehumidifyMode: function (value, callback) {
+    this.log.info('setDehumidifyMode: HomeKit requested to turn Dehumidify mode %s.', value ? 'ON' : 'OFF');
+
+    if (!value) {
+      this.Dehumidify_Mode = false;
+      // Answer HomeKit straight away, then reconcile the fan speed once the unit
+      // has actually accepted the power-off.
+      this.setActive(0, () => this.refreshFanSpeed());
+      if (callback) callback();
+      return;
+    }
+
+    this.sendGetRequest(this.get_control_info, body => {
+      const responseValues = this.parseResponse(body);
+      // f_rate=A is Daikin's automatic fan rate; many units ignore f_rate in dry mode anyway.
+      let query = `pow=1&mode=2&stemp=${responseValues.stemp}&shum=${responseValues.shum}&dt2=${responseValues.dt2}&dh2=${responseValues.dh2}&f_rate=A&f_dir=${this.swingMode}`;
+      query = query
+        .replace(/stemp=--/, `stemp=${responseValues.dt2}`)
+        .replace(/shum=--/, `shum=${'0'}`);
+
+      this.log.debug('setDehumidifyMode: Query is: %s', query);
+      this.Dehumidify_Mode = true;
+      this.log.debug('setDehumidifyMode: update DehumidifyMode: %s.', this.Dehumidify_Mode);
+      this.sendGetRequest(this.set_control_info + '?' + query, _response => {
+        this.Dehumidify_Mode = true;
+        this.log.debug('setDehumidifyMode: confirmed DehumidifyMode: %s.', this.Dehumidify_Mode);
+        // getActive already reports dry mode as OFF to HomeKit; push the whole AC state now
+        // so the accessory does not keep showing auto/heat/cool until the next poll. These
+        // are the same values the poll settles on for pow=1,mode=2: inactive, idle, auto.
+        this.HeaterCooler_Active = Characteristic.Active.INACTIVE;
+        this.log.debug('setDehumidifyMode: update Active: %s.', this.HeaterCooler_Active);
+        this.heaterCoolerService.getCharacteristic(Characteristic.Active).updateValue(this.HeaterCooler_Active);
+
+        this.HeaterCooler_CurrentHeaterCoolerState = Characteristic.CurrentHeaterCoolerState.IDLE;
+        this.heaterCoolerService.getCharacteristic(Characteristic.CurrentHeaterCoolerState).updateValue(this.HeaterCooler_CurrentHeaterCoolerState);
+
+        this.HeaterCooler_TargetHeaterCoolerState = Characteristic.TargetHeaterCoolerState.AUTO;
+        this.heaterCoolerService.getCharacteristic(Characteristic.TargetHeaterCoolerState).updateValue(this.HeaterCooler_TargetHeaterCoolerState);
+        this.refreshFanSpeed();
+        if (callback) callback();
+      }, {skipCache: true, skipQueue: true});
+    }, {skipCache: true});
   },
 
   getPowerfulMode: function (callback) {
@@ -1781,6 +1891,11 @@ getFanSpeed: function (callback) {
     value = this.rawToDaikinSpeed(value);
     this.log.debug('setFanSpeed: this translates to Daikin f_rate value: %s', value);
 
+    // Dehumidify runs the fan on auto; picking a manual rate means the user has left it.
+    if (value !== 'A') {
+      this.clearDehumidifyMode('fan speed changed from auto');
+    }
+
     if (this.isFaikin) {
       // Faikout: set fan speed only, without affecting swing.
       // Native control JSON expects A/Q/1-5 rather than Daikin A/B/3-7.
@@ -2028,6 +2143,28 @@ getFanSpeed: function (callback) {
         
         this.log.info('===== NIGHT QUIET SWITCH ENABLED =====');
         this.log.info('Switch name configured as: "%s"', this.nightQuietModeName);
+        this.log.info('Toggle this switch ON and check the logs to identify it');
+        this.log.info('You can rename this switch in the Home app');
+        this.log.info('======================================');
+    }
+
+    if (this.enableDehumidifyMode) {
+        this.dehumidifyModeService
+            .getCharacteristic(Characteristic.On)
+            .on('get', this.getDehumidifyModeFV.bind(this))
+            .on('set', this.setDehumidifyMode.bind(this));
+
+        this.dehumidifyModeService
+            .getCharacteristic(Characteristic.ConfiguredName)
+            .on('set', (value, callback) => {
+                this.log.info('Dehumidify switch renamed to: "%s"', value);
+                callback();
+            });
+
+        services.push(this.dehumidifyModeService);
+
+        this.log.info('===== DEHUMIDIFY SWITCH ENABLED =====');
+        this.log.info('Switch name configured as: "%s"', this.dehumidifyModeName);
         this.log.info('Toggle this switch ON and check the logs to identify it');
         this.log.info('You can rename this switch in the Home app');
         this.log.info('======================================');
